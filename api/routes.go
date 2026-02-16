@@ -532,15 +532,63 @@ func (s *Server) handleStreamingMessages(c *gin.Context, apiURL string, payload 
 	// Stream in Anthropic format
 	events, errs := stream.ParseKiroStream(resp, s.Cfg.FirstTokenTimeout, true, s.Cfg)
 
-	c.Writer.WriteString("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"" + conversationID + "\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n")
+	// Send message_start event
+	messageStart := map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":         conversationID,
+			"type":       "message",
+			"role":       "assistant",
+			"content":    []interface{}{},
+			"model":      model,
+			"stop_reason": nil,
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": 0,
+			},
+		},
+	}
+	b, _ := json.Marshal(messageStart)
+	c.Writer.WriteString("event: message_start\ndata: " + string(b) + "\n\n")
 	flusher.Flush()
 
+	// Track content blocks
 	contentIndex := 0
+	textBlockStarted := false
+	thinkingBlockStarted := false
+	var textBlockIndex int
+	var thinkingBlockIndex int
+	var outputTokens int
 
 	for {
 		select {
 		case event, ok := <-events:
 			if !ok {
+				// Close any open blocks
+				if thinkingBlockStarted {
+					c.Writer.WriteString(fmt.Sprintf("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", thinkingBlockIndex))
+					flusher.Flush()
+				}
+				if textBlockStarted {
+					c.Writer.WriteString(fmt.Sprintf("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", textBlockIndex))
+					flusher.Flush()
+				}
+
+				// Send message_delta with final usage
+				messageDelta := map[string]interface{}{
+					"type": "message_delta",
+					"delta": map[string]interface{}{
+						"stop_reason": "end_turn",
+					},
+					"usage": map[string]interface{}{
+						"output_tokens": outputTokens,
+					},
+				}
+				b, _ := json.Marshal(messageDelta)
+				c.Writer.WriteString("event: message_delta\ndata: " + string(b) + "\n\n")
+				flusher.Flush()
+
+				// Send message_stop
 				c.Writer.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 				flusher.Flush()
 				return
@@ -549,9 +597,28 @@ func (s *Server) handleStreamingMessages(c *gin.Context, apiURL string, payload 
 			switch event.Type {
 			case "content":
 				if event.Content != "" {
+					// Start text block if not started
+					if !textBlockStarted {
+						textBlockIndex = contentIndex
+						contentIndex++
+						textBlockStarted = true
+						startBlock := map[string]interface{}{
+							"type":  "content_block_start",
+							"index": textBlockIndex,
+							"content_block": map[string]interface{}{
+								"type": "text",
+								"text": "",
+							},
+						}
+						b, _ := json.Marshal(startBlock)
+						c.Writer.WriteString("event: content_block_start\ndata: " + string(b) + "\n\n")
+						flusher.Flush()
+					}
+
+					// Send text delta
 					contentBlock := map[string]interface{}{
 						"type":  "content_block_delta",
-						"index": contentIndex,
+						"index": textBlockIndex,
 						"delta": map[string]interface{}{
 							"type": "text_delta",
 							"text": event.Content,
@@ -560,27 +627,136 @@ func (s *Server) handleStreamingMessages(c *gin.Context, apiURL string, payload 
 					b, _ := json.Marshal(contentBlock)
 					c.Writer.WriteString("event: content_block_delta\ndata: " + string(b) + "\n\n")
 					flusher.Flush()
+					outputTokens += len(event.Content) / 4
 				}
+
 			case "thinking":
 				if event.ThinkingContent != "" {
+					// Start thinking block if not started
+					if !thinkingBlockStarted {
+						thinkingBlockIndex = contentIndex
+						contentIndex++
+						thinkingBlockStarted = true
+						startBlock := map[string]interface{}{
+							"type":  "content_block_start",
+							"index": thinkingBlockIndex,
+							"content_block": map[string]interface{}{
+								"type":     "thinking",
+								"thinking": "",
+							},
+						}
+						b, _ := json.Marshal(startBlock)
+						c.Writer.WriteString("event: content_block_start\ndata: " + string(b) + "\n\n")
+						flusher.Flush()
+					}
+
+					// Send thinking delta
 					contentBlock := map[string]interface{}{
 						"type":  "content_block_delta",
-						"index": contentIndex,
+						"index": thinkingBlockIndex,
 						"delta": map[string]interface{}{
-							"type": "thinking_delta",
+							"type":     "thinking_delta",
 							"thinking": event.ThinkingContent,
 						},
 					}
 					b, _ := json.Marshal(contentBlock)
 					c.Writer.WriteString("event: content_block_delta\ndata: " + string(b) + "\n\n")
 					flusher.Flush()
+					outputTokens += len(event.ThinkingContent) / 4
 				}
+
+			case "tool_use":
+				if event.ToolUse != nil {
+					// Close thinking block if open
+					if thinkingBlockStarted {
+						c.Writer.WriteString(fmt.Sprintf("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", thinkingBlockIndex))
+						flusher.Flush()
+						thinkingBlockStarted = false
+					}
+
+					// Close text block if open
+					if textBlockStarted {
+						c.Writer.WriteString(fmt.Sprintf("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", textBlockIndex))
+						flusher.Flush()
+						textBlockStarted = false
+					}
+
+					tool := event.ToolUse
+					toolID, _ := tool["id"].(string)
+					if toolID == "" {
+						toolID = utils.GenerateToolUseID()
+					}
+
+					// Get tool name and input
+					var toolName string
+					var toolInput interface{}
+
+					if fn, ok := tool["function"].(map[string]interface{}); ok {
+						toolName, _ = fn["name"].(string)
+						toolInput = fn["arguments"]
+					} else if name, ok := tool["name"].(string); ok {
+						toolName = name
+						toolInput = tool["input"]
+					}
+
+					// Parse input if string
+					if inputStr, ok := toolInput.(string); ok && inputStr != "" {
+						var parsed interface{}
+						if err := json.Unmarshal([]byte(inputStr), &parsed); err == nil {
+							toolInput = parsed
+						}
+					}
+					if toolInput == nil {
+						toolInput = map[string]interface{}{}
+					}
+
+					// Send content_block_start for tool_use
+					toolBlockIndex := contentIndex
+					contentIndex++
+					startBlock := map[string]interface{}{
+						"type":  "content_block_start",
+						"index": toolBlockIndex,
+						"content_block": map[string]interface{}{
+							"type":  "tool_use",
+							"id":    toolID,
+							"name":  toolName,
+							"input": map[string]interface{}{},
+						},
+					}
+					b, _ := json.Marshal(startBlock)
+					c.Writer.WriteString("event: content_block_start\ndata: " + string(b) + "\n\n")
+					flusher.Flush()
+
+					// Send content_block_delta with input_json_delta
+					inputJSON, _ := json.Marshal(toolInput)
+					deltaBlock := map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": toolBlockIndex,
+						"delta": map[string]interface{}{
+							"type":         "input_json_delta",
+							"partial_json": string(inputJSON),
+						},
+					}
+					b, _ = json.Marshal(deltaBlock)
+					c.Writer.WriteString("event: content_block_delta\ndata: " + string(b) + "\n\n")
+					flusher.Flush()
+
+					// Send content_block_stop
+					c.Writer.WriteString(fmt.Sprintf("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", toolBlockIndex))
+					flusher.Flush()
+
+					outputTokens += len(toolName) / 2
+				}
+
+			case "context_usage":
+				// Context usage info - used for token calculation
+				// Will be used in message_delta if available
 			}
 
 		case err := <-errs:
 			if err != nil {
 				errorBlock := map[string]interface{}{
-					"type":  "error",
+					"type": "error",
 					"error": map[string]interface{}{
 						"type":    "internal_error",
 						"message": err.Error(),

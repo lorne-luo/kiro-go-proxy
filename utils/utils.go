@@ -14,9 +14,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// GenerateToolCallID generates a unique tool call ID
+// GenerateToolCallID generates a unique tool call ID (OpenAI format)
 func GenerateToolCallID() string {
 	return "call_" + uuid.New().String()[:24]
+}
+
+// GenerateToolUseID generates a unique tool use ID (Anthropic format)
+func GenerateToolUseID() string {
+	return "toolu_" + uuid.New().String()[:24]
 }
 
 // GenerateConversationID generates a unique conversation ID
