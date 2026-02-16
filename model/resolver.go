@@ -57,10 +57,13 @@ func NewCache(cfg *config.Config) *Cache {
 }
 
 // Update updates the cache with model list from API
+// Completely replaces existing cache contents with new data
 func (c *Cache) Update(models []Info) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Replace entire cache (matches Python behavior)
+	c.models = make(map[string]Info)
 	for _, m := range models {
 		c.models[m.ModelID] = m
 	}
@@ -100,6 +103,49 @@ func (c *Cache) GetMaxInputTokens(modelID string) int {
 		return max
 	}
 	return 200000 // default
+}
+
+// SetMaxInputTokens sets max input tokens for a model
+func (c *Cache) SetMaxInputTokens(modelID string, maxTokens int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.maxInput[modelID] = maxTokens
+}
+
+// IsEmpty checks if the cache is empty
+func (c *Cache) IsEmpty() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return len(c.models) == 0
+}
+
+// Size returns the number of models in the cache
+func (c *Cache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return len(c.models)
+}
+
+// IsStale checks if the cache is stale (TTL exceeded or never updated)
+func (c *Cache) IsStale() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.lastUpdate.IsZero() {
+		return true
+	}
+	return time.Since(c.lastUpdate) > c.ttl
+}
+
+// LastUpdateTime returns the last update time
+func (c *Cache) LastUpdateTime() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	return c.lastUpdate
 }
 
 // AddHiddenModel adds a hidden model to the cache
